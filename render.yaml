@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: url-metadata-crawler
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: CLASSIFIER
+        value: keybert        # Switch to "ollama" when OLLAMA_BASE_URL points to your server
+      - key: OLLAMA_BASE_URL
+        value: http://localhost:11434
+      - key: OLLAMA_MODEL
+        value: llama3

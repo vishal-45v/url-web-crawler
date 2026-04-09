@@ -1,0 +1,45 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+.virtualenv/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model cache (large files - download at runtime)
+.cache/
+*.bin
+*.safetensors
+sentence_transformers/
+
+# Logs
+*.log
+logs/
+INTERVIEW_DOSSIER.csv
+LEARNING_ROADMAP.csv

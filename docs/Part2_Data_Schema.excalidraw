@@ -1,0 +1,41 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "https://excalidraw.com",
+  "elements": [
+    {"type":"text","id":"sch_title","x":245,"y":10,"text":"Unified Data Schema — URL Metadata Crawler","fontSize":24,"strokeColor":"#1e1e1e","width":680,"height":30},
+    {"type":"text","id":"sch_sub","x":295,"y":44,"text":"Three-tier storage:  Speed  |  Durability  |  Analytics","fontSize":18,"strokeColor":"#757575","width":580,"height":25},
+
+    {"type":"rectangle","id":"dyn_panel","x":40,"y":75,"width":330,"height":460,"backgroundColor":"#c3fae8","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#22c55e","strokeWidth":2},
+    {"type":"rectangle","id":"dyn_hdr","x":40,"y":75,"width":330,"height":48,"backgroundColor":"#22c55e","fillStyle":"solid","strokeColor":"#15803d","strokeWidth":2},
+    {"type":"text","id":"dyn_hdr_t","x":72,"y":90,"text":"DynamoDB — Metadata Store","fontSize":18,"strokeColor":"#ffffff","width":290,"height":25},
+
+    {"type":"rectangle","id":"dyn_why","x":55,"y":133,"width":300,"height":32,"backgroundColor":"#b2f2bb","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#22c55e","strokeWidth":1,"boundElements":[{"id":"txt_dyn_why","type":"text"}]},
+    {"type":"text","id":"txt_dyn_why","x":55,"y":133,"width":300,"height":32,"text":"Real-time lookup  |  O(1) per URL","fontSize":16,"fontFamily":1,"textAlign":"center","verticalAlign":"middle","containerId":"dyn_why","originalText":"Real-time lookup  |  O(1) per URL","strokeColor":"#1e1e1e"},
+
+    {"type":"text","id":"dyn_fields","x":57,"y":177,"text":"PK:  domain#url_hash\nSK:  crawled_at (ISO 8601)\n\ntitle        string\ndescription  string\ntopics       List of Maps\nword_count   number\nyear_month   string\ns3_path      string\nTTL:         365 days\n\nGSI: year_month-index\n(fetch all crawls per month)","fontSize":18,"strokeColor":"#1e1e1e","width":310,"height":300},
+
+    {"type":"rectangle","id":"s3_panel","x":400,"y":75,"width":295,"height":460,"backgroundColor":"#fff3bf","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#f59e0b","strokeWidth":2},
+    {"type":"rectangle","id":"s3_hdr","x":400,"y":75,"width":295,"height":48,"backgroundColor":"#f59e0b","fillStyle":"solid","strokeColor":"#b45309","strokeWidth":2},
+    {"type":"text","id":"s3_hdr_t","x":448,"y":90,"text":"S3 — Raw Archive","fontSize":18,"strokeColor":"#ffffff","width":210,"height":25},
+
+    {"type":"rectangle","id":"s3_why","x":415,"y":133,"width":265,"height":32,"backgroundColor":"#fff3bf","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#f59e0b","strokeWidth":1,"boundElements":[{"id":"txt_s3_why","type":"text"}]},
+    {"type":"text","id":"txt_s3_why","x":415,"y":133,"width":265,"height":32,"text":"Cheap  |  Durable  |  Athena-ready","fontSize":16,"fontFamily":1,"textAlign":"center","verticalAlign":"middle","containerId":"s3_why","originalText":"Cheap  |  Durable  |  Athena-ready","strokeColor":"#1e1e1e"},
+
+    {"type":"text","id":"s3_fields","x":417,"y":177,"text":"s3://url-metadata-crawl/\n\nraw-html/\n  {year_month}/\n    {domain}/\n      {url_hash}.html.gz\n\nmetadata/\n  {year_month}/\n    {domain}/\n      {url_hash}.json\n\nGzip: ~70% size savings\nLifecycle: Glacier after 12mo","fontSize":18,"strokeColor":"#1e1e1e","width":275,"height":300},
+
+    {"type":"rectangle","id":"aur_panel","x":725,"y":75,"width":395,"height":460,"backgroundColor":"#dbe4ff","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#4a9eed","strokeWidth":2},
+    {"type":"rectangle","id":"aur_hdr","x":725,"y":75,"width":395,"height":48,"backgroundColor":"#4a9eed","fillStyle":"solid","strokeColor":"#2563eb","strokeWidth":2},
+    {"type":"text","id":"aur_hdr_t","x":750,"y":90,"text":"Aurora PostgreSQL — Analytics","fontSize":18,"strokeColor":"#ffffff","width":360,"height":25},
+
+    {"type":"rectangle","id":"aur_why","x":740,"y":133,"width":365,"height":32,"backgroundColor":"#a5d8ff","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#4a9eed","strokeWidth":1,"boundElements":[{"id":"txt_aur_why","type":"text"}]},
+    {"type":"text","id":"txt_aur_why","x":740,"y":133,"width":365,"height":32,"text":"Complex SQL  |  Joins  |  Reporting","fontSize":16,"fontFamily":1,"textAlign":"center","verticalAlign":"middle","containerId":"aur_why","originalText":"Complex SQL  |  Joins  |  Reporting","strokeColor":"#1e1e1e"},
+
+    {"type":"text","id":"aur_fields","x":742,"y":177,"text":"crawl_results:\n  id           BIGSERIAL PK\n  url          TEXT\n  domain       TEXT\n  title        TEXT\n  word_count   INT\n  crawled_at   TIMESTAMPTZ\n  year_month   CHAR(7)\n  s3_html_path TEXT\n\ntopics:\n  crawl_id  BIGINT FK\n  topic     TEXT\n  score     FLOAT\n\nINDEX ON domain, year_month","fontSize":18,"strokeColor":"#1e1e1e","width":375,"height":340}
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "gridSize": null
+  },
+  "files": {}
+}
