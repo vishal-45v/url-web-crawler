@@ -1,269 +1,270 @@
 # Part 2 — Scale Design: Operationalizing Billions of URLs
 
-## Diagrams
+**Goal:** Process billions of URLs per month on AWS with no single point of failure, independent scaling per processing stage, and cost-optimised instance selection per workload type.
 
-| Diagram | Excalidraw Link |
-|---|---|
-| AWS Pipeline Architecture | https://excalidraw.com/#json=-eNdpOOW8Msvv9dXkRQ-x,z-UXPaeMHQ8cToT9FMH83Q |
-| Unified Data Schema | https://excalidraw.com/#json=dhZuNb7QZYoWi6qq_q2sT,XEKbLW1Nq5JW6IDd7NjXtw |
 
----
+See companion diagrams:
 
-## 1. System Architecture Overview
+- [Pipeline Architecture (Excalidraw)](https://excalidraw.com/#json=Qa81SJZLxyUJ17h07QEzr,rkwmT-oNzOrvtPi-JORQQQ) — end-to-end AWS pipeline with 4 dedicated fleets, inter-stage SQS queues, Bloom filter, and trade-off annotations
 
-### Pipeline Flow (left to right)
+<img width="1538" height="815" alt="Pipeline Architecture" src="https://github.com/user-attachments/assets/8266567a-4f6a-4944-8c09-a6a71e150b20" />
 
-```
-INPUT → QUEUE → PROCESSING → STORAGE → ANALYTICS
-  |        |         |            |          |
-  S3      SQS      ECS         S3 +       Glue +
-  MySQL   DLQ     Fargate    DynamoDB    Athena
-  EB              + Redis    + Aurora
-```
+- [`docs/Part2_Data_Schema.excalidraw`](docs/Part2_Data_Schema.excalidraw) — inter-stage SQS message schemas (①–④) + three-tier storage schemas
 
-### Input Layer
-| Source | Use Case |
-|---|---|
-| S3 (text file) | Bulk upload of billions of URLs for a crawl run |
-| RDS MySQL | Structured URL lists partitioned by `year_month`, `domain` |
-| EventBridge | Monthly cron trigger (`0 0 1 * *`) to kick off the crawl |
+<img width="1236" height="907" alt="Data Schema" src="https://github.com/user-attachments/assets/5fe8f9c5-dea6-49c9-af8b-1fc7cbdacc58" />
 
-**Why both S3 and MySQL?** S3 handles raw bulk input (one-time uploads). MySQL handles structured, queryable input (e.g., "give me all amazon.com URLs for July"). EventBridge decouples scheduling from the input source — the same trigger fires regardless of where URLs live.
 
-### Queue Layer
-- **SQS Main Queue**: Receives URL batches (1000 URLs/message). Visibility timeout = 5 min (matches max crawler runtime per batch).
-- **SQS Dead Letter Queue (DLQ)**: URLs that fail after 3 receive attempts. Triggers SNS alert. Can be manually re-queued after investigation.
-- **Retry strategy**: Exponential backoff within the worker; DLQ for systematic failures.
+## Core Design Principle: Decoupled Processing Fleets
 
-**Why SQS over Kafka?**
-- SQS is serverless, zero-ops, pay-per-message
-- At billions of URLs, Kafka requires cluster management overhead
-- SQS FIFO not needed here — URL order doesn't matter for metadata extraction
-- Kafka would be chosen if we needed replay, consumer groups, or event streaming to downstream systems in real-time
+The Part 1 monolith (`fastapi` app) handles Fetch → Extract → Classify → Store in a single synchronous request. That works for a REST API but fails at scale for three reasons:
 
-### Processing Layer — ECS Fargate
-- **Auto-scaling**: 10 (idle) → 500 tasks (peak), driven by SQS queue depth metric
-- **Each task**: Pulls 1000 URLs from SQS, crawls sequentially with 2s delay between requests per domain
-- **ElastiCache Redis**: Domain-level token bucket for rate limiting + robots.txt cache (24h TTL per domain)
-- **Politeness**: Each worker checks Redis before crawling. If token unavailable, requeues URL with delay.
-
-**Why ECS Fargate over Lambda?**
-- Lambda has 250MB package limit — breaks with Playwright + sentence-transformers
-- Lambda max timeout 15 min — insufficient for large batches
-- Fargate gives full container control, no cold-start penalty at scale
-
-**Why Fargate over EC2?**
-- No capacity planning — Fargate provisions on demand
-- Per-task billing — cost scales linearly with crawl volume
-- Trade-off: EC2 is cheaper per hour at 100% utilization. Use EC2 Spot if budget is critical.
-
-### Storage Layer — Three-Tier Design
-
-| Store | What | Access Pattern | Cost |
-|---|---|---|---|
-| S3 | Raw HTML (gzipped) | Sequential read, archival | ~$0.023/GB/month |
-| DynamoDB | Metadata + topics | Real-time point lookup | Pay-per-request |
-| Aurora PostgreSQL | Structured analytics | Complex SQL queries | Instance-based |
-
-**Why three stores instead of one?**
-Each store is optimized for a different access pattern. Using Aurora for everything would be expensive for point lookups at scale. Using DynamoDB for everything loses SQL analytics. S3 for raw HTML keeps compute costs separate from query costs.
-
-### Analytics Layer
-- **AWS Glue**: Crawls S3 metadata folder → builds Data Catalog (schema inference, partitioned by `year_month`/`domain`)
-- **Athena**: SQL on S3 via Glue catalog. Pay per TB scanned. Partition pruning on `year_month` reduces scan cost by 95%+.
-- **Grafana**: Connected to CloudWatch + Aurora for operational dashboards
-
----
-
-## 2. Unified Data Schema
-
-### DynamoDB — `page_metadata` Table
-
-```
-Partition Key:  domain#url_hash       (e.g. "amazon.com#a3f2b1...")
-Sort Key:       crawled_at            (ISO 8601, e.g. "2025-07-01T10:00:00Z")
-
-Attributes:
-  url             String
-  title           String
-  description     String
-  og_title        String
-  og_description  String
-  og_image        String
-  meta_keywords   StringSet
-  topics          List<Map {topic: String, score: Number}>
-  word_count      Number
-  classifier      String
-  year_month      String              (e.g. "2025-07")
-  s3_html_path    String
-  s3_meta_path    String
-  TTL             Number              (Unix timestamp, crawled_at + 365 days)
-
-GSI: year_month-crawled_at-index
-  Allows: "give me all URLs crawled in July 2025"
-```
-
-**Design decisions:**
-- `domain#url_hash` as PK keeps same-domain items together, enabling efficient domain-level scans
-- TTL auto-expires stale records, reducing storage costs without manual cleanup
-- Topics stored as a list of maps (not a separate table) — DynamoDB reads are always the full item anyway
-
-### S3 — Path Convention
-
-```
-s3://url-metadata-crawl/
-├── raw-html/
-│   └── {year_month}/
-│       └── {domain}/
-│           └── {url_hash}.html.gz
-└── metadata/
-    └── {year_month}/
-        └── {domain}/
-            └── {url_hash}.json
-
-Example:
-  raw-html/2025-07/amazon.com/a3f2b1c9.html.gz
-  metadata/2025-07/amazon.com/a3f2b1c9.json
-```
-
-**Design decisions:**
-- Partitioned by `year_month` first — Athena partition pruning dramatically reduces scan cost
-- `url_hash` (SHA-256 of normalized URL) as filename — collision-resistant, URL-safe, fixed length
-- Gzip compression: ~70% size reduction on HTML, ~50% on JSON
-- S3 Lifecycle rule: Standard → Intelligent-Tiering (30 days) → Glacier (12 months)
-
-### Aurora PostgreSQL — Analytics Schema
-
-```sql
-CREATE TABLE crawl_results (
-  id            BIGSERIAL PRIMARY KEY,
-  url           TEXT NOT NULL,
-  url_hash      CHAR(64) NOT NULL,
-  domain        TEXT NOT NULL,
-  title         TEXT,
-  description   TEXT,
-  word_count    INT,
-  classifier    VARCHAR(50),
-  crawled_at    TIMESTAMPTZ NOT NULL,
-  year_month    CHAR(7) NOT NULL,
-  s3_html_path  TEXT,
-  s3_meta_path  TEXT,
-  created_at    TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE topics (
-  id        BIGSERIAL PRIMARY KEY,
-  crawl_id  BIGINT NOT NULL REFERENCES crawl_results(id) ON DELETE CASCADE,
-  topic     TEXT NOT NULL,
-  score     FLOAT NOT NULL
-);
-
--- Indexes for common query patterns
-CREATE INDEX idx_crawl_domain_ym ON crawl_results(domain, year_month);
-CREATE INDEX idx_crawl_year_month ON crawl_results(year_month);
-CREATE UNIQUE INDEX idx_crawl_hash_ym ON crawl_results(url_hash, year_month);
-CREATE INDEX idx_topics_crawl_id ON topics(crawl_id);
-```
-
-**Design decisions:**
-- Aurora Serverless v2 — scales from 0.5 to 128 ACUs, no idle cost during off-peak
-- `url_hash + year_month` unique index prevents duplicate crawls for same month
-- Topics in a separate table — enables `GROUP BY topic` analytics across billions of crawls
-- Partition table by `year_month` (PostgreSQL declarative partitioning) when row count exceeds 100M
-
----
-
-## 3. SLOs and SLAs
-
-### SLOs (Internal Engineering Targets)
-
-| Metric | Target | Measurement Window |
+| Problem | Monolithic Worker | Decoupled Fleets |
 |---|---|---|
-| Crawl throughput | ≥ 10,000 URLs/minute (peak) | Per crawl run |
-| API P99 latency (`/crawl`) | ≤ 3 seconds | Rolling 1-hour |
-| API P50 latency (`/crawl`) | ≤ 800ms | Rolling 1-hour |
-| Crawl success rate | ≥ 95% of valid URLs | Per run |
-| DLQ rate | ≤ 2% of total URLs | Per run |
-| Data freshness | Metadata available within 1h of crawl | Per run |
-| S3 write durability | 99.999999999% (S3 guarantee) | Lifetime |
-| Monthly crawl completion | 100% of input URLs processed within 72h | Per month |
+| Stage crash | All 4 steps fail together | Only the crashed fleet halts; others keep processing |
+| Bottleneck scaling | Must scale whole worker for one slow stage | Scale only the bottleneck fleet |
+| Instance cost | Same instance type for all work | Fetch = I/O instance, Classify = GPU instance |
 
-### SLAs (External / Stakeholder Commitments)
+The solution is 4 independent fleets, each consuming from its own SQS queue:
 
-| Commitment | Value |
-|---|---|
-| API uptime | 99.9% (43.8 min/month downtime budget) |
-| Monthly crawl delivery | Results available by day 5 of following month |
-| Data retention | Raw HTML: 12 months, Metadata: 24 months |
-| Incident response | P0 (data loss): 30 min, P1 (crawl failure): 4 hours |
+```
+SQS Main Queue
+      │
+      ▼
+[Fetch Fleet]  ──── SQS Fetch→Extract ────► [Extract Fleet]
+                                                    │
+                                          SQS Extract→Classify
+                                                    │
+                                                    ▼
+                                          [Classify Fleet]
+                                                    │
+                                         SQS Classify→Store
+                                                    │
+                                                    ▼
+                                           [Store Fleet]
+                                         /      │       \
+                                        S3   DynamoDB  Aurora
+```
 
 ---
 
-## 4. Key Monitoring Metrics and Tools
+## Fleet Details
 
-### Tier 1 — Crawl Health (CloudWatch)
+### Fleet 1 — Fetch Fleet (I/O-bound)
 
-| Metric | Alarm Threshold | Action |
+**What it does:** Poll SQS Main Queue, fetch the URL, write raw HTML to S3, emit to Fetch→Extract Queue.
+
+**Code reuse:** `app/services/fetcher.py` — unchanged. The two-tier fetch strategy (httpx → Playwright fallback) runs inside each worker.
+
+**Instance type:** `c5.large` (2 vCPU, 4GB RAM). Fetch work is network I/O — compute is minimal. Playwright adds ~250MB overhead per active browser context.
+
+**Scaling trigger:** SQS Main Queue depth. Target: 1 task per 200 queued messages.
+
+**Key design:** HTML is written to S3 *immediately* by the Fetch Fleet, before any downstream processing. The S3 path flows through all subsequent queues. This keeps every inter-stage SQS message well under the 256 KB limit regardless of page size.
+
+**Output message (Fetch → Extract Queue):**
+```json
+{
+  "url":           "string",
+  "s3_html_path":  "s3://bucket/raw-html/2025-07/amazon.com/abc123.html.gz",
+  "status_code":   200,
+  "fetch_method":  "httpx | playwright",
+  "fetched_at":    "ISO 8601"
+}
+```
+
+---
+
+### Fleet 2 — Extract Fleet (CPU-light)
+
+**What it does:** Read HTML from S3 path in message, run BeautifulSoup extraction, emit structured metadata to Extract→Classify Queue.
+
+**Code reuse:** `app/services/extractor.py` — unchanged.
+
+**Instance type:** `t3.medium` (2 vCPU, 4GB RAM). Parsing HTML with lxml is fast and CPU-light (~10–50ms per page).
+
+**Scaling trigger:** Fetch→Extract Queue depth.
+
+**Output message (Extract → Classify Queue):**
+```json
+{
+  "url":            "string",
+  "canonical_url":  "string",
+  "title":          "string",
+  "description":    "string | null",
+  "og_title":       "string | null",
+  "og_description": "string | null",
+  "og_image":       "string | null",
+  "meta_keywords":  ["string"],
+  "body_text":      "string  (≤ 2500 chars — classifier budget)",
+  "word_count":     1842,
+  "s3_html_path":   "string"
+}
+```
+
+---
+
+### Fleet 3 — Classify Fleet (CPU/GPU-bound)
+
+**What it does:** Read extracted metadata from queue, run topic classification, emit full crawl result to Classify→Store Queue.
+
+**Code reuse:** `app/services/classifier/` — unchanged. Classifier is selected by `CLASSIFIER` env var at fleet launch time.
+
+**Instance type (KeyBERT):** `c5.2xlarge` (8 vCPU, 16GB RAM). all-MiniLM-L6-v2 is CPU-efficient; multiple workers per instance.
+
+**Instance type (Ollama):** `g4dn.xlarge` (4 vCPU, 16GB RAM, 1× T4 GPU). Ollama drops from ~2s (CPU) to ~300ms (GPU). Isolated fleet means GPU instances are not wasted on Fetch/Extract work.
+
+**Scaling trigger:** Extract→Classify Queue depth. This fleet is typically the bottleneck — it gets more instances allocated relative to others.
+
+**Swapping classifiers:** `CLASSIFIER=keybert` vs `CLASSIFIER=ollama` is set as an ECS task environment variable. No code changes. Re-deploy the fleet with the new env var.
+
+**Output message (Classify → Store Queue):**
+```json
+{
+  "url":             "string",
+  "canonical_url":   "string",
+  "title":           "string",
+  "description":     "string | null",
+  "og_title":        "string | null",
+  "og_description":  "string | null",
+  "og_image":        "string | null",
+  "meta_keywords":   ["string"],
+  "topics":          [{"topic": "compact toaster", "score": 0.9134}],
+  "word_count":      1842,
+  "crawled_at":      "ISO 8601",
+  "s3_html_path":    "string",
+  "classifier_used": "keybert"
+}
+```
+
+---
+
+### Fleet 4 — Store Fleet (I/O-bound, parallel writes)
+
+**What it does:** Read full crawl result from queue, write concurrently to 3 storage sinks (S3 metadata JSON, DynamoDB, Aurora), ack SQS message.
+
+**Code reuse:** New `store.py` module (thin wrapper around 3 write calls). The data models (`CrawlResponse`) are reused unchanged.
+
+**Instance type:** `t3.medium`. All 3 writes are async I/O — the fleet is network-bound, not compute-bound. Async writes to all 3 sinks run concurrently (not sequentially).
+
+**Scaling trigger:** Classify→Store Queue depth.
+
+**Why 3 sinks?** Each serves a different access pattern:
+
+| Sink | Access Pattern | Why |
 |---|---|---|
-| `SQS ApproximateNumberOfMessagesVisible` | > 500K (falling behind) | Scale up ECS tasks |
-| `SQS NumberOfMessagesSent to DLQ` | > 2% of throughput | PagerDuty alert → investigate |
-| `ECS CPUUtilization` | > 85% for 5min | Scale out |
-| `ECS MemoryUtilization` | > 80% | Alert + investigate OOM risk |
-| Crawl success rate | < 95% | P1 alert |
-
-### Tier 2 — API Performance (CloudWatch + X-Ray)
-
-| Metric | Alarm |
-|---|---|
-| API P99 latency | > 3s → alert |
-| 5xx error rate | > 1% → alert |
-| Playwright fallback rate | > 40% (indicates JS-render spike) → alert |
-| KeyBERT inference time | > 1s P95 → investigate model load |
-
-### Tier 3 — Storage and Cost (CloudWatch + AWS Cost Explorer)
-
-| Metric | Action |
-|---|---|
-| S3 storage growth rate | Alert if > 2x expected monthly growth |
-| DynamoDB consumed RCU/WCU | Auto-scaling configured; alert at 80% provisioned |
-| Aurora CPU | > 70% sustained → scale up instance |
-| Athena bytes scanned per query | Alert if > 1TB (partition pruning failure) |
-
-### Observability Stack
-
-| Tool | Purpose |
-|---|---|
-| **CloudWatch** | Metrics, alarms, log aggregation, dashboards |
-| **X-Ray** | Distributed tracing across fetch → extract → classify → store |
-| **SNS + PagerDuty** | Alert routing (P0/P1 to on-call, P2 to Slack) |
-| **Grafana** | Executive and operational dashboards (connected to CloudWatch + Aurora) |
-| **AWS Cost Explorer** | Daily cost anomaly detection; budget alerts at 80% of monthly cap |
+| DynamoDB | `GET /metadata?url=...` → O(1) lookup | Real-time API reads; 365-day TTL auto-expires old data |
+| S3 | Archive + Athena queries | Raw HTML at ~$0.023/GB/month; Glue/Athena for analytics |
+| Aurora | `GROUP BY domain`, joins, reports | SQL analytics; Serverless v2 scales to zero between batch runs |
 
 ---
 
-## 5. Cost Optimization Levers
+## URL Deduplication — Bloom Filter
 
-| Lever | Savings |
-|---|---|
-| ECS Spot tasks for crawl workers (with on-demand fallback) | ~60% compute cost reduction |
-| S3 Intelligent-Tiering for raw HTML | ~40% storage cost after 30 days |
-| S3 Glacier after 12 months | ~85% storage cost vs Standard |
-| Athena partition pruning on `year_month` | ~95% reduction in bytes scanned |
-| DynamoDB on-demand billing (no reserved capacity) | Pay only during active crawl windows |
-| Ollama on EC2 (self-hosted) vs OpenAI API | $0 vs ~$0.002/URL for topic classification |
-| Bloom filter dedup before queuing | Avoid re-crawling ~30% of URLs (duplicate/redirect variants) |
+Before any URL is enqueued to SQS Main Queue, a Bloom filter check runs against ElastiCache Redis.
+
+- **What it prevents:** re-crawling URLs already processed in the current monthly batch
+- **Savings:** ~30% of candidate URLs are duplicates → 30% fewer SQS messages, S3 writes, DynamoDB writes
+- **False positive rate:** 0.1% (acceptable — we occasionally skip a URL that wasn't actually crawled)
+- **Storage:** 64MB Redis Bloom filter ≈ 500M URL fingerprints
+- **Degradation:** if Redis is unavailable, the filter is bypassed and all URLs proceed (crawl duplicates rather than lose URLs)
 
 ---
 
-## 6. Reliability and Fault Tolerance
+## Failure Handling
 
-| Failure Scenario | Mitigation |
-|---|---|
-| ECS task crashes mid-batch | SQS visibility timeout expires → message requeued automatically |
-| Target site returns 429 | Exponential backoff in worker; if 3 retries fail → DLQ |
-| Playwright timeout | 15s timeout → fallback to httpx-only metadata extraction |
-| DynamoDB throttle | On-demand mode auto-scales; no throttle under normal conditions |
-| Aurora failover | Aurora Multi-AZ; automatic failover in < 30s |
-| S3 write failure | Worker retries with AWS SDK built-in retry (3 attempts) |
-| Redis unavailable | Rate limiter degrades gracefully (bypasses check, logs warning) |
-| Entire region outage | S3 cross-region replication for raw HTML; DynamoDB Global Tables (optional) |
+### Per-fleet retry
+
+Each SQS queue has a visibility timeout (5 min). If a worker crashes mid-processing, the message becomes visible again after 5 min. After 3 failures, the message moves to a fleet-specific DLQ.
+
+```
+SQS Queue (maxReceiveCount=3)
+      │
+      │  failure × 3
+      ▼
+Fleet DLQ  ──► SNS Alert ──► PagerDuty / Slack
+```
+
+### Partial failure isolation
+
+If the Classify Fleet crashes entirely:
+- Fetch and Extract fleets keep running, filling the Extract→Classify Queue
+- Classify Queue acts as a buffer (SQS retention: 14 days)
+- When Classify Fleet recovers, it drains the accumulated queue
+- **No data loss.** No re-crawl needed.
+
+This is the key advantage over a monolithic worker — a monolithic fleet crash loses all in-flight work across all stages.
+
+### ElastiCache Redis failure
+
+Redis is used for rate limiting and robots.txt caching. If Redis becomes unavailable:
+- Rate limiting is skipped (we crawl slightly faster than politeness rules prefer)
+- robots.txt is re-fetched per request instead of cached
+- **Processing continues.** Redis is an optimisation, not a hard dependency.
+
+---
+
+## Auto-scaling
+
+Each fleet has independent CloudWatch auto-scaling:
+
+| Fleet | Scaling Metric | Target | Min | Max |
+|---|---|---|---|---|
+| Fetch | SQS Main Queue depth | 200 msgs/task | 5 | 500 |
+| Extract | Fetch→Extract Queue depth | 500 msgs/task | 3 | 200 |
+| Classify | Extract→Classify Queue depth | 100 msgs/task | 3 | 200 |
+| Store | Classify→Store Queue depth | 500 msgs/task | 3 | 100 |
+
+**Classify gets the tightest target** (100 msgs/task) because classification is the slowest step (~300ms–2s per URL). Fetch and Store are fast, so they need fewer tasks per message volume.
+
+Scale-in cooldown: 5 minutes (prevents thrashing when queue briefly drains).
+
+---
+
+## Monitoring
+
+| Signal | Tool | Alert Condition |
+|---|---|---|
+| Queue depth per fleet | CloudWatch Metrics | > 10,000 messages → warn; > 100,000 → page |
+| DLQ depth | CloudWatch Alarms | > 0 messages → page (every DLQ message is a failure) |
+| Fleet task count | CloudWatch | < min tasks running → page |
+| Crawl success rate | Custom metric | < 95% success rate → warn |
+| End-to-end latency | X-Ray traces | P99 > 30s → warn |
+| Redis availability | ElastiCache Metrics | Connection errors → warn (non-critical) |
+
+---
+
+## How Part 1 Code Maps to Part 2
+
+The Part 1 services are **pure Python modules with no framework coupling**. Each becomes the core of one fleet worker:
+
+| Part 1 Module | Part 2 Fleet | Change Required |
+|---|---|---|
+| `app/services/fetcher.py` | Fetch Fleet worker | None — wrap in SQS poll loop |
+| `app/services/extractor.py` | Extract Fleet worker | None — wrap in SQS poll loop |
+| `app/services/classifier/` | Classify Fleet worker | None — wrap in SQS poll loop |
+| `app/models/schemas.py` | All fleets | None — Pydantic models reused for message validation |
+| `app/main.py` | Retired | Replaced by 4 worker entry points |
+| *(new)* `worker/store.py` | Store Fleet worker | New — 3 concurrent async writes |
+
+The entry point changes from `POST /crawl` HTTP request to SQS message poll. The business logic — fetch, extract, classify — is identical.
+
+---
+
+## Cost Estimate at 1 Billion URLs/Month
+
+| Component | Assumption | Monthly Cost |
+|---|---|---|
+| ECS Fargate — Fetch | 100 tasks × 730h × c5.large | ~$7,000 |
+| ECS Fargate — Extract | 30 tasks × 730h × t3.medium | ~$700 |
+| ECS Fargate — Classify (KeyBERT) | 80 tasks × 730h × c5.2xlarge | ~$9,000 |
+| ECS Fargate — Store | 30 tasks × 730h × t3.medium | ~$700 |
+| SQS (5 queues × 1B messages) | $0.40 per 1M messages | ~$2,000 |
+| S3 storage (HTML + metadata) | ~500TB at $0.023/GB + PUT costs | ~$12,000 |
+| DynamoDB (1B writes + reads) | On-demand pricing | ~$3,000 |
+| Aurora Serverless v2 | Batch analytics, scales to zero | ~$500 |
+| ElastiCache Redis | cache.r6g.large | ~$200 |
+| CloudWatch + X-Ray | Metrics, logs, traces | ~$500 |
+| **Total (KeyBERT)** | | **~$35,600/month** |
+| **Total (Ollama/GPU)** | Replace CPU classify with g4dn.xlarge | **~$42,000/month** |
+
+> KeyBERT saves ~$6,400/month vs Ollama at this scale. The strategy pattern makes this a one-line env var change — switch between them based on quality requirements and budget.
