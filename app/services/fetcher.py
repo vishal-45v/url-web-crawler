@@ -57,8 +57,6 @@ async def _fetch_httpx(url: str) -> str:
                 raise
             await asyncio.sleep(2 ** attempt)
 
-    return ""
-
 
 async def _fetch_playwright(url: str) -> str:
     """Fallback path: headless Chromium for JS-rendered pages (e.g. Amazon SPAs)."""

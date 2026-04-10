@@ -1,5 +1,5 @@
 # Official Playwright Python image — Chromium system dependencies pre-installed
-FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.50.0-jammy
 
 WORKDIR /app
 

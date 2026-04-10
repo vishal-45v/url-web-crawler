@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List
 from datetime import datetime
 
@@ -9,7 +9,7 @@ class CrawlRequest(BaseModel):
 
 class Topic(BaseModel):
     topic: str
-    score: float
+    score: float = Field(..., ge=0.0, le=1.0)
 
 
 class CrawlResponse(BaseModel):

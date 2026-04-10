@@ -5,6 +5,10 @@ from app.models.schemas import Topic
 from app.services.classifier.base import BaseClassifier
 from app.config.settings import settings
 
+# LLM generation takes longer than a standard HTTP fetch.
+# Keep this separate from request_timeout (which governs page fetching).
+_OLLAMA_TIMEOUT = 60
+
 _PROMPT = """\
 You are a content classifier. Extract the top 10 most relevant topics from this web page.
 
@@ -31,7 +35,7 @@ class OllamaClassifier(BaseClassifier):
     async def classify(self, text: str, title: str = "") -> List[Topic]:
         prompt = _PROMPT.format(title=title, content=text[:3000])
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=_OLLAMA_TIMEOUT) as client:
             response = await client.post(
                 f"{settings.ollama_base_url}/api/generate",
                 json={
@@ -50,9 +54,13 @@ class OllamaClassifier(BaseClassifier):
         if start == -1 or end == 0:
             return []
 
-        items = json.loads(raw[start:end])
+        try:
+            items = json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            return []
+
         return [
-            Topic(topic=item["topic"], score=float(item.get("score", 0.0)))
+            Topic(topic=item["topic"], score=round(float(item.get("score", 0.0)), 4))
             for item in items
-            if item.get("topic")
+            if isinstance(item, dict) and item.get("topic")
         ]

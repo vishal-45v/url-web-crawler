@@ -26,7 +26,7 @@ class KeyBERTClassifier(BaseClassifier):
         self._load()
 
         # Prepend title for better context; cap body at 2500 chars for speed
-        combined = f"{title}. {text[:2500]}"
+        combined = f"{title}. {text[:2500]}" if title else text[:2500]
 
         keywords = self._model.extract_keywords(
             combined,

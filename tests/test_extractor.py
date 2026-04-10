@@ -153,3 +153,10 @@ def test_whitespace_collapsed_in_title():
     html = "<html><head><title>  Extra   Spaces  </title></head><body>text</body></html>"
     result = extract(html, "https://example.com")
     assert result["title"] == "Extra Spaces"
+
+
+def test_blank_title_tag_returns_none():
+    """A <title> with only whitespace should return None, not an empty string."""
+    html = "<html><head><title>   </title></head><body>content</body></html>"
+    result = extract(html, "https://example.com")
+    assert result["title"] is None

@@ -18,7 +18,7 @@ def extract(html: str, url: str) -> dict:
         tag.decompose()
 
     # --- Title ---
-    title = _clean(soup.title.get_text()) if soup.title else None
+    title = (_clean(soup.title.get_text()) if soup.title else None) or None
 
     # --- Meta description ---
     meta_desc_tag = soup.find("meta", attrs={"name": "description"})

@@ -7,12 +7,14 @@ Tests cover:
   - Classifier name property
   - Factory singleton behaviour (same instance returned on repeated calls)
   - Factory raises ValueError for unknown classifier names
+  - OllamaClassifier graceful handling of malformed JSON responses
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from app.models.schemas import Topic
 from app.services.classifier.keybert_classifier import KeyBERTClassifier
+from app.services.classifier.ollama_classifier import OllamaClassifier
 from app.services.classifier import factory
 
 
@@ -142,3 +144,52 @@ def test_factory_error_message_includes_classifier_name():
         mock_settings.classifier = "bad_name"
         with pytest.raises(ValueError, match="bad_name"):
             factory.get_classifier()
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier — error handling
+# ---------------------------------------------------------------------------
+
+async def test_ollama_malformed_json_returns_empty_list():
+    """Ollama returning invalid JSON between brackets should not crash — return []."""
+    classifier = OllamaClassifier()
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"response": "[not valid json{{"}
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("app.services.classifier.ollama_classifier.httpx.AsyncClient") as mock_client:
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+        topics = await classifier.classify("body text", "Page Title")
+
+    assert topics == []
+
+
+async def test_ollama_no_json_brackets_returns_empty_list():
+    """Ollama returning plain text with no JSON array should return []."""
+    classifier = OllamaClassifier()
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"response": "Sorry, I cannot classify this."}
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("app.services.classifier.ollama_classifier.httpx.AsyncClient") as mock_client:
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+        topics = await classifier.classify("body text", "Page Title")
+
+    assert topics == []
+
+
+async def test_keybert_empty_title_does_not_prepend_dot():
+    """Empty title should not produce '. body text' — title prefix is omitted."""
+    classifier = KeyBERTClassifier()
+    mock_model = MagicMock()
+    mock_model.extract_keywords.return_value = []
+    classifier._model = mock_model
+
+    await classifier.classify(text="body content", title="")
+
+    call_args = mock_model.extract_keywords.call_args[0][0]
+    assert not call_args.startswith(".")

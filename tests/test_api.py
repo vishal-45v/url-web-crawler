@@ -101,6 +101,23 @@ def test_crawl_502_detail_includes_reason():
     assert "DNS resolution failed" in response.json()["detail"]
 
 
+def test_crawl_extract_failure_returns_500():
+    with patch("app.main.fetch", new=AsyncMock(return_value="<html>mock</html>")):
+        with patch("app.main.extract", side_effect=Exception("parser crashed")):
+            response = client.post("/crawl", json={"url": "https://example.com"})
+    assert response.status_code == 500
+    assert "parser crashed" in response.json()["detail"]
+
+
+def test_crawl_invalid_classifier_returns_500():
+    with patch("app.main.fetch", new=AsyncMock(return_value="<html>mock</html>")):
+        with patch("app.main.extract", return_value=MOCK_METADATA):
+            with patch("app.main.get_classifier", side_effect=ValueError("Unknown classifier: 'bad'")):
+                response = client.post("/crawl", json={"url": "https://example.com"})
+    assert response.status_code == 500
+    assert "Unknown classifier" in response.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # POST /crawl — successful response structure
 # ---------------------------------------------------------------------------

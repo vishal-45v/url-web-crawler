@@ -40,8 +40,15 @@ async def crawl(request: CrawlRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
 
-    metadata = extract(html, url)
-    classifier = get_classifier()
+    try:
+        metadata = extract(html, url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract metadata: {e}")
+
+    try:
+        classifier = get_classifier()
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     topics = await classifier.classify(
         text=metadata["body_text"],
