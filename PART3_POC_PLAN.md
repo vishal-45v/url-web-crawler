@@ -9,252 +9,243 @@ The Proof of Concept answers three questions before full-scale investment:
 | Question | Success Criterion |
 |---|---|
 | Can the crawler handle all page types? | All 3 test URLs return correct metadata |
-| Can the pipeline sustain throughput? | ≥ 5,000 URLs/min in load test |
-| Is the cost model viable? | Estimated monthly cost < $2,000 for 1B URLs/month |
+| Can the pipeline sustain throughput? | ≥ 5,000 URLs/min under load test |
+| Is the cost model viable? | Actual AWS spend extrapolates to < $50K/month at 1B URLs |
+
+> **Note on cost target:** The Part 2 architecture estimates ~$35,600/month at 1B URLs/month (KeyBERT fleet). The POC validates that the cost model scales linearly — not that we hit an arbitrary budget number. The right question is: does actual load-test cost extrapolate predictably to the design estimate?
 
 ---
 
-## 2. Implementation Schedule (Solo Developer)
+## 2. Implementation Schedule (Solo Developer, Startup Pace)
 
-> Estimates assume 1 developer, 8 working hours/day, no major unknowns.
-> Buffer of 20% added to each phase for integration surprises.
+> Estimates assume 1 developer, 8 working hours/day.
+> Part 1 code (fetcher, extractor, classifier) is **already complete** — Phase 1 adapts it for the worker model, not rebuilds it.
+> Startup pace: parallel where possible, no ceremony for ceremony's sake.
 
 ### Phase 0 — Environment & CI/CD Setup
-**Duration: 3 days**
+**Duration: 1 day** *(was 3 — AWS console + Terraform modules are fast with experience)*
 
-| Day | Task | Done When |
-|---|---|---|
-| 1 | AWS account, IAM roles, VPC, ECR repository, S3 buckets | `aws sts get-caller-identity` succeeds; ECR repo visible |
-| 2 | Local dev: Docker, Python 3.11, Playwright chromium, `.env` wired | `docker build .` passes locally |
-| 3 | GitHub Actions pipeline: test → build → push ECR → deploy ECS | Push to `main` triggers deploy |
+| Task | Done When |
+|---|---|
+| AWS account, IAM roles, VPC, ECR repo, S3 buckets, SQS queues | `aws sts get-caller-identity` succeeds; resources visible in console |
+| GitHub Actions: test → build → push ECR → deploy ECS | Push to `main` auto-deploys |
 
-**Risk:** AWS account limits (ECR, ECS, ElastiCache) may need quota increase requests. Submit Day 1.
-
----
-
-### Phase 1 — Core Crawler (Part 1 Code)
-**Duration: 5 days**
-
-| Day | Task | Done When |
-|---|---|---|
-| 1 | `fetcher.py` — httpx + Playwright fallback | All 3 test URLs return HTML > 1500 chars |
-| 2 | `extractor.py` — BeautifulSoup metadata extraction | Title, description, OG tags extracted from all 3 URLs |
-| 3 | `keybert_classifier.py` + `ollama_classifier.py` | ≥ 5 relevant topics returned per URL |
-| 4 | FastAPI endpoints `/crawl`, `/health`, OpenAPI docs | Postman collection passes; Swagger UI renders |
-| 5 | Render deployment + smoke test on live URLs | Live endpoint returns valid JSON for all 3 test URLs |
-
-**Milestone: Part 1 Demo Ready**
+**Risk:** AWS quota increase requests (ECS task limits, ElastiCache nodes) — submit on Day 1, takes 24–48h to process.
 
 ---
 
-### Phase 2 — Queue + Worker Infrastructure
-**Duration: 6 days**
+### Phase 1 — Worker Adaptation (Part 1 Code → Pipeline Worker)
+**Duration: 1 day** *(Part 1 core logic already complete — this wraps it in an SQS poll loop)*
+
+| Task | Done When |
+|---|---|
+| `worker/fetch_worker.py` — poll SQS Main Queue → call `fetcher.py` → write HTML to S3 → emit to Fetch→Extract Queue | 100-URL batch processed locally, S3 object visible |
+| `worker/extract_worker.py`, `classify_worker.py`, `store_worker.py` — same pattern per fleet | End-to-end: URL in SQS → metadata in DynamoDB via 4 workers |
+
+**Why so fast?** `fetcher.py`, `extractor.py`, and `classifier/` are unchanged. Worker scripts are thin poll-loop wrappers — each is ~50 lines.
+
+---
+
+### Phase 2 — Queue + Fleet Infrastructure
+**Duration: 3 days** *(was 6 — SQS/ECS setup is fast; Redis + auto-scaling are config, not code)*
 
 | Day | Task | Done When |
 |---|---|---|
-| 1 | SQS Main Queue + DLQ created; IAM policy for ECS → SQS | SQS visible in console; test message sent/received |
-| 2 | Worker script: poll SQS → crawl → ack; batch size = 100 URLs | 100-URL batch processed end-to-end locally |
-| 3 | ECS Fargate task definition; Docker image deployed to ECR | ECS task runs, logs appear in CloudWatch |
-| 4 | ElastiCache Redis: domain token bucket + robots.txt cache | Rate limiter correctly throttles same-domain requests |
-| 5 | Auto-scaling policy: SQS depth → ECS task count | 10 → 100 tasks in < 3 min under simulated load |
-| 6 | Integration test: 10,000 URLs pumped through pipeline | < 2% DLQ rate; all 9,800+ URLs in DynamoDB |
+| 1 | 4 inter-stage SQS queues + DLQs; IAM policies for ECS → SQS + S3 + DynamoDB | Test message flows end-to-end through all 4 queues |
+| 2 | ECS Fargate task definitions for all 4 fleets; Docker images pushed to ECR; ElastiCache Redis wired | All 4 ECS services running; CloudWatch logs visible |
+| 3 | Auto-scaling: SQS depth → ECS task count per fleet; integration test 10K URLs | 10K URLs processed; < 2% DLQ rate; all in DynamoDB |
 
 ---
 
 ### Phase 3 — Storage Layer
-**Duration: 4 days**
+**Duration: 2 days** *(was 4 — schemas are defined in Part 2; implementation is mechanical)*
 
 | Day | Task | Done When |
 |---|---|---|
-| 1 | DynamoDB table: PK/SK, GSI (year_month-index), TTL, on-demand | `aws dynamodb describe-table` shows correct schema |
-| 2 | S3 buckets: path convention, lifecycle rules, gzip write tested | Sample HTML written and readable from correct path |
-| 3 | Aurora PostgreSQL: schema migrations, connection pool (max=100) | `crawl_results` and `topics` tables created; INSERT works |
-| 4 | AWS Glue crawler + Athena test: query metadata by domain + month | Athena query returns correct row count, < 5s runtime |
+| 1 | DynamoDB: PK/SK, GSI (year_month-index), TTL; S3 lifecycle rules (Glacier 12mo) | Schema validated; sample write + read works |
+| 2 | Aurora PostgreSQL: `crawl_results` + `topics` tables, PgBouncer pooler; Glue crawler + Athena test query | Athena query returns correct row count, < 10s |
 
 ---
 
 ### Phase 4 — Observability
-**Duration: 3 days**
+**Duration: 1 day** *(was 3 — CloudWatch dashboards over Grafana for POC speed)*
 
-| Day | Task | Done When |
-|---|---|---|
-| 1 | CloudWatch alarms: SQS depth, DLQ rate, ECS CPU/Memory | Alarms visible; test trigger fires SNS notification |
-| 2 | X-Ray tracing: annotate fetch → extract → classify → store | Trace appears in X-Ray console with all segments |
-| 3 | Grafana dashboard: crawl throughput, success rate, latency, cost | Dashboard readable by non-technical stakeholder |
+| Task | Done When |
+|---|---|
+| CloudWatch alarms: SQS depth per fleet, DLQ rate, ECS CPU/memory | Test alarm fires SNS notification |
+| CloudWatch dashboard: crawl throughput, success rate, queue depths | Dashboard readable by non-technical stakeholder |
+| X-Ray tracing: annotate each fleet's critical path | Trace visible in X-Ray console |
 
----
-
-### Phase 5 — Load Testing & Hardening
-**Duration: 4 days**
-
-| Day | Task | Done When |
-|---|---|---|
-| 1 | Load test: 1M URLs, measure throughput, DLQ rate, cost | ≥ 5,000 URLs/min sustained; DLQ < 2% |
-| 2 | Identify and fix bottlenecks (likely: Aurora connections, Redis) | Re-run load test shows ≥ 15% throughput improvement |
-| 3 | Chaos test: kill 50% of ECS tasks mid-run; verify recovery | All in-flight URLs reprocessed; no data loss |
-| 4 | Cost analysis: actual vs projected; optimize top 3 levers | Cost projection for 1B URLs within $2,000 budget |
+> Grafana is production polish — skip for POC. CloudWatch dashboards are sufficient to demo observability.
 
 ---
 
-### Phase 6 — Release
-**Duration: 3 days**
+### Phase 5 — Load Test & Cost Validation
+**Duration: 2 days** *(was 4 — 100K URL test is sufficient for extrapolation; don't need 1M for a POC)*
 
 | Day | Task | Done When |
 |---|---|---|
-| 1 | Documentation: README, architecture.md, runbook, API spec | PR reviewed and merged; docs render correctly |
-| 2 | Canary deployment: 10% traffic to new version; monitor 2h | Zero P0 alerts; error rate unchanged |
-| 3 | Full production go-live: 100% traffic; team sign-off | Stakeholder demo passes; go/no-go form signed |
+| 1 | Load test: 100K URLs pumped through pipeline; measure throughput, DLQ rate, per-fleet scaling | ≥ 5,000 URLs/min sustained; DLQ < 2% |
+| 2 | Chaos test: kill 50% of ECS tasks mid-run; verify queue recovery; check AWS Cost Explorer for the run | No data loss; cost extrapolation documented |
+
+**Cost validation:** Run actual AWS cost for 100K-URL test → multiply to 1B. Compare against $35,600/month Part 2 estimate. Acceptable variance: ±20%.
 
 ---
 
-**Total: ~28 working days (≈ 5.5 weeks, solo developer)**
+### Phase 6 — POC Release
+**Duration: 1 day** *(was 3 — a POC demo is not a production release)*
+
+| Task | Done When |
+|---|---|
+| Docs: update README, architecture.md, runbook (top 5 failure scenarios) | PR merged |
+| Stakeholder demo: live crawl of all 3 test URLs through the pipeline | Go/no-go form signed |
+
+> **No Blue/Green canary for a POC.** Blue/Green is production release ceremony. A POC ships to a demo environment, gets signed off, and the production hardening plan is scoped separately.
+
+---
+
+**Total: ~11 working days (≈ 2.5 weeks, solo developer)**
 
 ```
-Week 1:  Phase 0 + Phase 1 (core crawler live on Render)
-Week 2:  Phase 2 partial (queue + workers)
-Week 3:  Phase 2 complete + Phase 3 (storage layer)
-Week 4:  Phase 4 + Phase 5 (observability + load test)
-Week 5:  Phase 5 complete + Phase 6 (hardening + release)
-Week 5.5: Buffer for unknown blockers
+Week 1:  Phase 0 + Phase 1 + Phase 2 (infra up, workers running)
+Week 2:  Phase 3 + Phase 4 + Phase 5 (storage, observability, load test)
+Week 2.5: Phase 6 (docs + demo)
 ```
+
+**vs. original estimate of 5.5 weeks:**
+- Phase 0: 3 days → 1 day (AWS setup is fast for an experienced engineer)
+- Phase 1: 5 days → 1 day (code already exists from Part 1)
+- Phase 2: 6 days → 3 days (SQS/ECS are config-heavy, not code-heavy)
+- Phase 3: 4 days → 2 days (schemas are already designed in Part 2)
+- Phase 4: 3 days → 1 day (CloudWatch over Grafana for POC)
+- Phase 5: 4 days → 2 days (100K URLs sufficient for extrapolation)
+- Phase 6: 3 days → 1 day (POC demo ≠ production release ceremony)
 
 ---
 
 ## 3. Blockers — Known vs Unknown
 
-### Known Blockers (Trivial — solved with standard approaches)
+### Known Blockers (Handled — standard solutions)
 
-| # | Blocker | Severity | Solution | ETA to Resolve |
+| # | Blocker | Severity | Solution | ETA |
 |---|---|---|---|---|
-| K1 | Amazon blocks scrapers (bot detection) | Medium | Playwright headless + random User-Agent + 2s delay | Already handled in fetcher.py |
-| K2 | robots.txt fetch adds latency per domain | Low | Cache in Redis with 24h TTL; fetch once per domain | Phase 2, Day 4 |
-| K3 | SQS 256KB message size limit | Low | Batch 100 URLs/message (avg URL ~100 chars → 10KB/batch) | Phase 2, Day 2 |
-| K4 | Playwright memory (~250MB per Chromium instance) | Medium | 1 Playwright instance per ECS task; task memory = 1GB | Phase 2, Day 3 |
-| K5 | KeyBERT model cold-start on first request | Low | Pre-download model at Docker build time (`RUN python -c "..."`) | Already in Dockerfile |
-| K6 | URL normalization — same page, different query params | Low | Normalize: strip UTM params, sort params, lowercase scheme | Phase 2, Day 2 (URL normalizer utility) |
-| K7 | Render free tier spins down after inactivity | Low | Configure Render health check ping every 5 min (UptimeRobot) | Phase 1, Day 5 |
+| K1 | Amazon bot detection | Medium | Playwright headless + random User-Agent + 2s delay | Already in `fetcher.py` |
+| K2 | robots.txt fetch latency per domain | Low | Redis cache, 24h TTL | Phase 2, Day 2 |
+| K3 | SQS 256KB message size limit | Low | Store HTML in S3; pass S3 path in message (never raw HTML) | Phase 1 design |
+| K4 | Playwright memory (~250MB per Chromium) | Medium | 1 Playwright instance per Fetch Worker task; 1GB task memory | Phase 2, Day 2 |
+| K5 | KeyBERT model cold-start | Low | Pre-download at Docker build time | Already in Dockerfile |
+| K6 | URL normalization (UTM variants) | Low | Strip UTM params, sort query params, lowercase scheme | Phase 1 |
+| K7 | AWS quota limits | Medium | Submit increase requests Day 1 (24–48h SLA) | Phase 0, Day 1 |
 
-### Unknown Blockers (High-risk — require investigation)
+### Unknown Blockers (High-risk — investigate during POC)
 
-| # | Blocker | Risk Level | Contingency | Discovery ETA |
+| # | Blocker | Risk | Contingency | Discovery Point |
 |---|---|---|---|---|
-| U1 | Aurora connection pool exhaustion at 500 concurrent ECS tasks | High | Add PgBouncer connection pooler in front of Aurora; or switch to Aurora Data API | Phase 5 load test |
-| U2 | DynamoDB hot partition — high-volume domains (amazon.com) concentrate writes | Medium | Add random suffix to PK: `domain#url_hash#shard(0-9)`; sharded PK spreads writes | Phase 5 load test |
-| U3 | Glue catalog partition discovery lag (new year_month partitions not immediately queryable in Athena) | Medium | Manual `MSCK REPAIR TABLE` after each run; or use Glue crawler schedule | Phase 3, Day 4 |
-| U4 | Site-specific anti-bot JS challenges (Cloudflare, hCaptcha) | High | Proxy rotation service (Bright Data, Oxylabs); flagged URLs rerouted to manual queue | Phase 1-2 integration |
-| U5 | ECS Fargate cold-start latency (60-90s to pull image + start) | Low-Medium | Keep minimum 10 tasks always running; pre-warm on schedule | Phase 2 auto-scaling test |
-| U6 | Redis ElastiCache network latency adding >50ms per URL | Low | Ensure Redis in same VPC/AZ as ECS tasks; use Redis Cluster with read replicas | Phase 5 profiling |
+| U1 | Aurora connection exhaustion at 500 concurrent Store workers | High | PgBouncer in front of Aurora; or Aurora Data API (serverless connection model) | Phase 5 load test |
+| U2 | DynamoDB hot partition on high-volume domains | Medium | Append shard suffix to PK: `domain#url_hash#shard(0-9)` | Phase 5 load test |
+| U3 | Glue catalog partition lag (new `year_month` not immediately queryable) | Low | `MSCK REPAIR TABLE` post-run; or Glue crawler schedule | Phase 3, Day 2 |
+| U4 | Cloudflare / hCaptcha JS challenges blocking ~15% of URLs | High | Proxy rotation (Bright Data / Oxylabs); flagged URLs routed to manual DLQ | Phase 1–2 |
+| U5 | ECS Fargate cold-start latency (60–90s image pull) | Medium | Minimum 2 tasks always running per fleet; pre-warm on cron schedule | Phase 2 auto-scaling |
+| U6 | Redis network latency > 50ms/URL (rate limit check) | Low | Ensure Redis in same VPC/AZ as ECS tasks | Phase 5 profiling |
 
 ---
 
 ## 4. Go / No-Go Criteria
 
-The POC is considered successful when ALL of the following pass:
+The POC is successful when ALL of the following pass:
 
 | Criterion | Target | How to Measure |
 |---|---|---|
-| All 3 test URLs return correct metadata | 100% | Manual validation of API response |
+| All 3 test URLs return correct metadata | 100% | Manual API response validation |
 | Crawl throughput | ≥ 5,000 URLs/min sustained | CloudWatch `SQS NumberOfMessagesDeleted` over 10 min |
-| Crawl success rate | ≥ 90% (DLQ rate ≤ 10%) | `DLQ_count / total_messages` |
-| API P99 latency | ≤ 3 seconds | CloudWatch `TargetResponseTime P99` |
-| Data consistency | 100% of crawled URLs found in DynamoDB | Count match: SQS sent vs DynamoDB items |
-| Cost projection | < $2,000 / 1B URLs | AWS Cost Calculator based on load test metrics |
-| Recovery from failure | No data loss after killing 50% of tasks | Re-run count + DynamoDB total after chaos test |
-| Automated alerting | DLQ alert fires within 5 min of threshold breach | Inject 5% failure rate; confirm SNS notification |
+| Crawl success rate | ≥ 95% (DLQ ≤ 5%) | `DLQ_count / total_messages` |
+| End-to-end pipeline latency | URL enters Main Queue → stored in DynamoDB ≤ 60s | X-Ray trace, P99 |
+| Data consistency | 100% of successful crawls in DynamoDB | Count: SQS sent vs DynamoDB items |
+| Cost extrapolation | Actual 100K-URL cost × 10,000 within ±20% of $35,600/month estimate | AWS Cost Explorer |
+| Recovery from failure | No data loss after killing 50% of tasks | Reprocessed count + DynamoDB total after chaos |
+| Automated alerting | DLQ alarm fires within 5 min of breach | Inject 5% failures; confirm SNS |
 
 ---
 
 ## 5. Evaluation of the POC
 
-### How to Evaluate Correctness
+### Test URL Set
+
 ```
-Test Set: 3 provided URLs + 10 additional URLs across categories:
-  - E-commerce product page (Amazon)
-  - Blog/editorial (REI)
-  - News article (CNN)
-  - SPA (React-rendered page)
-  - Page with no meta description
-  - Page returning 301 redirect
-  - Page with robots.txt disallow
-  - Non-English page (Chinese)
-  - Minimal HTML page
-  - PDF (should return 415)
+Core (3 provided):
+  - Amazon product page (JS-rendered SPA)
+  - REI blog post (static HTML)
+  - CNN news article (static HTML)
+
+Extended (7 additional):
+  - React SPA (client-side rendered)
+  - Page with no meta description (fallback test)
+  - 301 redirect chain
+  - Non-English page (Japanese/Chinese)
+  - Minimal HTML (just title + body)
+  - PDF URL (should return 415 Unsupported)
+  - robots.txt disallow (should skip or flag)
 ```
 
-For each test URL, validate:
+For each URL, validate:
 1. `title` matches visible page title ✓/✗
 2. `description` is meaningful (> 20 chars, not noise) ✓/✗
-3. `topics` — at least 5 relevant topics with score > 0.5 ✓/✗
+3. `topics` — ≥ 5 relevant topics with score > 0.5 ✓/✗
 4. `word_count` > 0 ✓/✗
-5. `crawled_at` is within 10 seconds of request time ✓/✗
+5. `crawled_at` within 10s of request ✓/✗
 
-### How to Evaluate Scale Performance
-- Inject 100K URLs into SQS
-- Measure wall-clock time to empty queue
-- Calculate URLs/min; compare against 5,000 target
-- Check DynamoDB item count matches input count
-- Check DLQ count
+### Scale Validation
 
-### How to Evaluate Cost
-- Run 100K URL crawl; check AWS Cost Explorer for that hour
-- Extrapolate to 1B URLs: `actual_cost × (1B / 100K)`
-- Compare against $2,000 budget
+- Inject 100K URLs into SQS Main Queue
+- Measure wall-clock time to drain queue across all 4 fleet stages
+- Calculate URLs/min; validate ≥ 5,000 target
+- Confirm DynamoDB item count matches input
+- Record actual AWS cost; extrapolate to 1B
 
 ---
 
-## 6. Release Plan
+## 6. Release Plan (POC → Production)
 
-### Release Stages
+### POC Release (End of Week 2.5)
+
+The POC ships to a **demo environment** — not production. The release is:
+1. Stakeholder demo: live crawl of all 3 test URLs through the full pipeline
+2. Metrics shown on CloudWatch dashboard
+3. Go/no-go form signed
+
+### Production Release (Post-POC, Separate Scope)
+
+Once POC is signed off, production release follows a 3-stage rollout:
 
 ```
-Alpha (Week 3)     → Internal only, 10K URLs, 2 domains (amazon.com, blog.rei.com)
-Beta  (Week 4)     → Extended team, 1M URLs, 5 domains, observability live
-RC    (Week 5)     → Full load test, all domains, chaos test passed
-GA    (Week 5.5)   → Production go-live, canary → 10% → 50% → 100%
+Stage 1 (Week 1): Shadow mode — pipeline runs alongside existing system, writes to separate DynamoDB table
+Stage 2 (Week 2): 10% traffic — route 10% of monthly crawl batch to new pipeline; monitor DLQ rate
+Stage 3 (Week 3): 100% cutover — decommission old pipeline after 1 week of clean metrics
 ```
 
-### Deployment Strategy — Blue/Green via ECS
+**Rollback trigger:** DLQ rate > 5% OR P0 alert during any stage → immediately reroute to old pipeline.
+**Rollback time:** < 5 min (SQS routing change, no code deploy needed).
 
-```
-Current (Blue):  ECS Service v1 — 0 tasks (idle post-POC)
-New     (Green): ECS Service v2 — 10 tasks minimum
-
-Step 1: Deploy Green alongside Blue
-Step 2: Route 10% of SQS messages to Green workers (via queue routing)
-Step 3: Monitor for 2 hours — zero P0 alerts
-Step 4: Route 100% to Green; deregister Blue
-Step 5: Keep Blue task definition for 7-day rollback window
-```
-
-### Rollback Plan
-- Trigger: DLQ rate > 10% OR P0 alert fires during canary
-- Action: Reroute SQS back to Blue workers (< 2 min)
-- Data: DynamoDB writes are idempotent (same PK/SK = overwrite, not duplicate)
-- SLA impact: Zero — Blue workers continue processing during rollback
-
-### Definition of a High-Quality Release
+### Definition of Production-Ready
 
 | Dimension | Standard |
 |---|---|
-| **Code** | 80%+ unit test coverage on extractor + classifier; integration tests for all 10 test URLs |
-| **Documentation** | README, architecture.md, runbook, API spec (auto-generated via FastAPI) all up to date |
-| **Observability** | All CloudWatch alarms active; Grafana dashboard reviewed by stakeholder |
+| **Code** | ≥ 80% unit test coverage; integration tests for all 10 test URLs |
+| **Docs** | README, architecture.md, runbook (top 5 failure scenarios) up to date |
+| **Observability** | All CloudWatch alarms active; cost alert set at 80% monthly budget |
 | **Security** | No hardcoded credentials; all secrets in AWS Secrets Manager; IAM least-privilege |
-| **Cost** | AWS Cost Explorer alert set at 80% of monthly budget |
-| **Runbook** | On-call runbook covers top 5 failure scenarios with clear remediation steps |
-| **Sign-off** | Engineering lead + product owner sign go/no-go form before GA |
+| **Sign-off** | Engineering lead + product owner sign go/no-go before Stage 3 cutover |
 
 ---
 
-## 7. Next Steps Post-POC (Roadmap)
+## 7. Post-POC Roadmap
 
 | Priority | Feature | Rationale |
 |---|---|---|
-| P0 | Proxy rotation for anti-bot sites | Unblocks the ~15% of URLs behind Cloudflare |
-| P0 | URL deduplication (Bloom filter in Redis) | Eliminates ~30% redundant crawls from UTM variants |
-| P1 | Ollama on dedicated EC2 instance (GPU) | LLM-quality classification at zero API cost |
-| P1 | Incremental re-crawl (change detection) | Re-crawl only URLs changed since last month — reduces cost 60% |
-| P2 | Multi-region deployment (us-east-1 + eu-west-1) | Geographic load distribution; resilience |
+| P0 | Proxy rotation for anti-bot sites | Unblocks ~15% of URLs behind Cloudflare |
+| P0 | Bloom filter dedup in Redis | Eliminates ~30% redundant crawls from UTM variants |
+| P1 | Ollama on dedicated GPU EC2 | LLM-quality classification at zero API cost; ~$6K/month savings vs KeyBERT at scale |
+| P1 | Incremental re-crawl (change detection via S3 ETag) | Re-crawl only changed URLs — reduces cost ~60% |
+| P2 | Multi-region (us-east-1 + eu-west-1) | Geographic distribution; resilience |
 | P2 | Content diff store (S3) | Track metadata changes over time for trend analysis |
-| P3 | Domain-aware taxonomy classification | Better topic quality per vertical (e-commerce vs news) |
-| P3 | Real-time crawl API (WebSocket progress) | Allow stakeholders to monitor live crawl status |
+| P3 | Domain-aware taxonomy | Better topic quality per vertical (e-commerce vs news vs editorial) |
